@@ -2,6 +2,7 @@ package com.soutiwang.app
 
 import android.app.Application
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.soutiwang.app.data.Question
@@ -53,7 +54,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }.onSuccess {
                 currentPreview.value = it
             }.onFailure {
-                message.value = "导入失败：${it.message ?: "文件格式无法读取"}"
+                Log.e(TAG, "Failed to import xlsx", it)
+                message.value = "导入失败：无法解析该 Excel 文件，请确认文件为 .xlsx 格式，且包含题干和答案列。"
             }
             isLoading.value = false
         }
@@ -121,5 +123,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeMessage() {
         message.value = null
+    }
+
+    companion object {
+        private const val TAG = "MainViewModel"
     }
 }

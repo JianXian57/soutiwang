@@ -44,7 +44,5 @@ dependencies {
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
 
-    implementation("org.dhatim:fastexcel-reader:0.18.4")
-
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.6")
 }

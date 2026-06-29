@@ -2,9 +2,11 @@ package com.soutiwang.app.importer
 
 import android.content.ContentResolver
 import android.net.Uri
-import org.dhatim.fastexcel.reader.ReadableWorkbook
+import android.util.Xml
 import java.io.InputStream
 import java.text.Normalizer
+import java.util.zip.ZipInputStream
+import org.xmlpull.v1.XmlPullParser
 
 class XlsxQuestionImporter(private val resolver: ContentResolver) {
     fun parse(uri: Uri, sourceFileName: String): ImportPreview {
@@ -57,17 +59,126 @@ class XlsxQuestionImporter(private val resolver: ContentResolver) {
         )
     }
 
-    private fun readRows(input: InputStream): List<List<String>> =
-        ReadableWorkbook(input).use { workbook ->
-            val sheet = workbook.firstSheet
-            sheet.openStream().use { stream ->
-                stream.map { row ->
-                    (0 until MAX_COLUMNS).map { col ->
-                        normalizeCell(row.getCellText(col))
-                    }.dropLastWhile { it.isBlank() }
-                }.toList()
+    private fun readRows(input: InputStream): List<List<String>> {
+        val entries = readXlsxEntries(input)
+        val sharedStrings = entries["xl/sharedStrings.xml"]?.let(::parseSharedStrings).orEmpty()
+        val sheetEntry = entries["xl/worksheets/sheet1.xml"]
+            ?: entries.entries.firstOrNull { it.key.startsWith("xl/worksheets/sheet") && it.key.endsWith(".xml") }?.value
+            ?: throw IllegalArgumentException("xlsx 文件中没有找到工作表")
+        return parseWorksheet(sheetEntry, sharedStrings)
+    }
+
+    private fun readXlsxEntries(input: InputStream): Map<String, ByteArray> {
+        val entries = mutableMapOf<String, ByteArray>()
+        ZipInputStream(input).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                val name = entry.name.trimStart('/')
+                if (!entry.isDirectory && (name == "xl/sharedStrings.xml" || name.startsWith("xl/worksheets/"))) {
+                    entries[name] = zip.readBytes()
+                }
+                zip.closeEntry()
             }
         }
+        if (entries.isEmpty()) throw IllegalArgumentException("不是有效的 xlsx 文件")
+        return entries
+    }
+
+    private fun parseSharedStrings(xml: ByteArray): List<String> {
+        val parser = newParser(xml)
+        val values = mutableListOf<String>()
+        var current: StringBuilder? = null
+
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "si" -> current = StringBuilder()
+                    "t" -> current?.append(parser.nextText())
+                }
+                XmlPullParser.END_TAG -> if (parser.name == "si") {
+                    values += normalizeCell(current?.toString().orEmpty())
+                    current = null
+                }
+            }
+        }
+        return values
+    }
+
+    private fun parseWorksheet(xml: ByteArray, sharedStrings: List<String>): List<List<String>> {
+        val parser = newParser(xml)
+        val rows = mutableListOf<List<String>>()
+        var rowCells: MutableMap<Int, String>? = null
+        var fallbackColumn = 0
+
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "row" -> {
+                        rowCells = linkedMapOf()
+                        fallbackColumn = 0
+                    }
+                    "c" -> {
+                        val cellRef = parser.getAttributeValue(null, "r")
+                        val column = cellRef?.let(::columnIndexFromCellRef) ?: fallbackColumn
+                        val type = parser.getAttributeValue(null, "t")
+                        val value = parseCell(parser, type, sharedStrings)
+                        rowCells?.put(column, normalizeCell(value))
+                        fallbackColumn = column + 1
+                    }
+                }
+                XmlPullParser.END_TAG -> if (parser.name == "row") {
+                    rows += rowCells.toRow()
+                    rowCells = null
+                }
+            }
+        }
+        return rows
+    }
+
+    private fun parseCell(parser: XmlPullParser, type: String?, sharedStrings: List<String>): String {
+        var rawValue = ""
+        val inlineText = StringBuilder()
+
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "v" -> rawValue = parser.nextText()
+                    "t" -> inlineText.append(parser.nextText())
+                }
+                XmlPullParser.END_TAG -> if (parser.name == "c") {
+                    return when (type) {
+                        "s" -> rawValue.toIntOrNull()?.let { sharedStrings.getOrNull(it) }.orEmpty()
+                        "inlineStr" -> inlineText.toString()
+                        else -> rawValue.ifBlank { inlineText.toString() }
+                    }
+                }
+            }
+        }
+        return ""
+    }
+
+    private fun MutableMap<Int, String>?.toRow(): List<String> {
+        if (this == null || isEmpty()) return emptyList()
+        val width = (keys.maxOrNull() ?: -1) + 1
+        return (0 until width).map { get(it).orEmpty() }.dropLastWhile { it.isBlank() }
+    }
+
+    private fun newParser(xml: ByteArray): XmlPullParser =
+        Xml.newPullParser().apply {
+            setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+            setInput(xml.inputStream(), "UTF-8")
+        }
+
+    private fun columnIndexFromCellRef(ref: String): Int {
+        var index = 0
+        var seenColumn = false
+        for (ch in ref) {
+            if (!ch.isLetter()) break
+            seenColumn = true
+            index = index * 26 + (ch.uppercaseChar() - 'A' + 1)
+        }
+        return if (seenColumn) index - 1 else 0
+    }
 
     private fun detectColumns(header: List<String>): ColumnMapping {
         val normalized = header.map { normalizeHeader(it) }
